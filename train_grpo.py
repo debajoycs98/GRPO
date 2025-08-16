@@ -1,4 +1,3 @@
-# train_grpo.py
 import re
 import torch
 from datasets import load_dataset, Dataset
@@ -7,10 +6,39 @@ from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 import os
 import logging
+import argparse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Add argument parser for W&B flag
+parser = argparse.ArgumentParser(description="GRPO Training Script")
+parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging")
+args = parser.parse_args()
+
+# Initialize W&B conditionally
+use_wandb = not args.disable_wandb
+if use_wandb:
+    import wandb
+    wandb.init(
+        project="grpo-gsm8k",
+        name=f"grpo-run-{os.getenv('RUN_NAME', 'default')}",
+        config={
+            "model": os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct"),
+            "learning_rate": 5e-6,
+            "batch_size": 2,
+            "epochs": 1
+        }
+    )
+else:
+    logger.info("W&B logging disabled")
+
+# Helper function for conditional logging
+def log_to_wandb(data):
+    """Log to W&B only if enabled"""
+    if use_wandb:
+        wandb.log(data)
 
 # Load and prep dataset
 SYSTEM_PROMPT = """
@@ -48,24 +76,16 @@ def extract_hash_answer(text: str) -> str | None:
         return None
     return text.split("####")[1].strip()
 
-# Validate environment variables
+# Environment variables
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
-if not MODEL_NAME:
-    raise ValueError("MODEL_NAME environment variable is not set.")
-
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs/default-GRPO")
-if not OUTPUT_DIR:
-    raise ValueError("OUTPUT_DIR environment variable is not set.")
-
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./models")
 RUN_NAME = os.getenv("RUN_NAME", "default-GRPO-gsm8k")
-if not RUN_NAME:
-    raise ValueError("RUN_NAME environment variable is not set.")
 
-# Configurable one-shot prompting
 def get_gsm8k_questions(split="train", use_one_shot=False) -> Dataset:
     """Loads and prepares the GSM8K dataset with optional one-shot prompting."""
     try:
         data = load_dataset('openai/gsm8k', 'main')[split]
+        log_to_wandb({"dataset_size": len(data)})  # Conditional logging
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
         raise
@@ -87,32 +107,54 @@ def get_gsm8k_questions(split="train", use_one_shot=False) -> Dataset:
 
 dataset = get_gsm8k_questions(use_one_shot=True)
 
-# Reward functions
+# Simplified reward functions with conditional logging
 def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
     """Calculates reward based on correctness of the response."""
     responses = [completion[0]['content'] for completion in completions]
-    q = prompts[0][-1]['content']
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    logger.info(f"Question:\n{q}\nAnswer:\n{answer[0]}\nResponse:\n{responses[0]}\nExtracted:\n{extracted_responses[0]}")
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    rewards = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    
+    # Conditional logging - just accuracy
+    accuracy = sum(1 for r in rewards if r > 0) / len(rewards)
+    log_to_wandb({"accuracy": accuracy})
+    
+    return rewards
 
 def int_reward_func(completions, **kwargs) -> list[float]:
     """Calculates reward if the extracted response is a digit."""
     responses = [completion[0]['content'] for completion in completions]
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+    rewards = [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+    
+    # Conditional logging
+    digit_rate = sum(1 for r in rewards if r > 0) / len(rewards)
+    log_to_wandb({"digit_extraction_rate": digit_rate})
+    
+    return rewards
 
 def format_reward_func(completions, strict=False, **kwargs) -> list[float]:
     """Calculates reward based on XML formatting."""
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$" if strict else r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
+    matches = [re.search(pattern, r, re.DOTALL) for r in responses]
+    rewards = [0.5 if match else 0.0 for match in matches]
+    
+    # Conditional logging
+    format_rate = sum(1 for r in rewards if r > 0) / len(rewards)
+    log_to_wandb({"format_success_rate": format_rate})
+    
+    return rewards
 
 def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     """Calculates reward based on XML tag counts."""
     contents = [completion[0]["content"] for completion in completions]
-    return [count_xml(c) for c in contents]
+    rewards = [count_xml(c) for c in contents]
+    
+    # Conditional logging
+    avg_xml_score = sum(rewards) / len(rewards) if rewards else 0
+    log_to_wandb({"avg_xml_score": avg_xml_score})
+    
+    return rewards
 
 def count_xml(text) -> float:
     """Counts XML tags and penalizes extra content."""
@@ -134,9 +176,14 @@ try:
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
         device_map="auto"
     ).to("cuda")
+    
+    # Conditional model info logging
+    num_params = sum(p.numel() for p in model.parameters())
+    log_to_wandb({"model_parameters": num_params})
+    
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     raise
@@ -144,18 +191,9 @@ except Exception as e:
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 tokenizer.pad_token = tokenizer.eos_token
 
-# PEFT config (optional)
-peft_config = LoraConfig(
-    r=16,
-    lora_alpha=64,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
-    task_type="CAUSAL_LM",
-    lora_dropout=0.05,
-)
-
-# Training config
+# Training config - conditional report_to
 training_args = GRPOConfig(
-    output_dir=OUTPUT_DIR,
+    output_dir="./models",
     run_name=RUN_NAME,
     learning_rate=5e-6,
     adam_beta1=0.9,
@@ -163,17 +201,18 @@ training_args = GRPOConfig(
     weight_decay=0.1,
     warmup_ratio=0.1,
     lr_scheduler_type='cosine',
-    logging_steps=1,
+    logging_steps=10,  # Log every 10 steps
     bf16=True,
-    per_device_train_batch_size=2,  # Increased from 1
-    gradient_accumulation_steps=2,  # Reduced from 4
-    num_generations=8,  # Reduced from 16
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=2,
+    num_generations=8,
+    generation_batch_size=8,
     max_prompt_length=256,
-    max_completion_length=786,
+    max_completion_length=1024,
     num_train_epochs=1,
     save_steps=100,
     max_grad_norm=0.1,
-    report_to="wandb",
+    report_to="wandb" if use_wandb else None,  # Conditional reporting
     log_on_each_node=False,
 )
 
@@ -183,18 +222,29 @@ trainer = GRPOTrainer(
     processing_class=tokenizer,
     reward_funcs=[
         xmlcount_reward_func,
-        format_reward_func,  # No need for lambda, just pass the function
+        format_reward_func,
         int_reward_func,
         correctness_reward_func
     ],
     args=training_args,
     train_dataset=dataset,
-    # peft_config=peft_config  # Uncomment if PEFT is working for you
 )
 
-# Train the model
+# Train with simple error handling
 try:
+    logger.info("Starting training...")
+    log_to_wandb({"status": "training_started"})
+    
     trainer.train()
+    
+    log_to_wandb({"status": "training_completed"})
+    logger.info("Training completed!")
+    
 except Exception as e:
     logger.error(f"Training failed: {e}")
+    log_to_wandb({"status": "training_failed", "error": str(e)})
     raise
+
+finally:
+    if use_wandb:
+        wandb.finish()
