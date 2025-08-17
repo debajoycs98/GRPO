@@ -7,244 +7,102 @@ from trl import GRPOConfig, GRPOTrainer
 import os
 import logging
 import argparse
+import wandb
+import time
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Add argument parser for W&B flag
-parser = argparse.ArgumentParser(description="GRPO Training Script")
-parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging")
+from load_dataset import get_gsm8k_questions, extract_xml_answer, extract_hash_answer,  SYSTEM_PROMPT, XML_COT_FORMAT
+from reward_utils import correctness_reward_func, int_reward_func, format_reward_func, xmlcount_reward_func
+
+parser = argparse.ArgumentParser(description="Training script for GRPO")
+parser.add_argument("--output_dir", type=str, default="./models", help="Output directory")
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Model name")
+parser.add_argument("--run_name", type=str, default="GRPO_gsm8k_Qwen2.5-1.5B-Instruct", help="Run name")
+parser.add_argument("--num_samples", type=int, default=5000, help="Number of samples to use for training")
 args = parser.parse_args()
 
-# Initialize W&B conditionally
-use_wandb = not args.disable_wandb
-if use_wandb:
-    import wandb
-    wandb.init(
-        project="grpo-gsm8k",
-        name=f"grpo-run-{os.getenv('RUN_NAME', 'default')}",
-        config={
-            "model": os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct"),
-            "learning_rate": 5e-6,
-            "batch_size": 2,
-            "epochs": 1
-        }
-    )
-else:
-    logger.info("W&B logging disabled")
+# Add a timestamp to run name just the date
+timestamp = time.strftime("%Y%m%d")
+wandb.init(project=args.run_name,name=f"{args.run_name}_{timestamp}")
 
-# Helper function for conditional logging
-def log_to_wandb(data):
-    """Log to W&B only if enabled"""
-    if use_wandb:
-        wandb.log(data)
+#Main Code
+dataset = get_gsm8k_questions(split="train", use_one_shot=True)
 
-# Load and prep dataset
-SYSTEM_PROMPT = """
-Respond in the following format:
+dataset = dataset.select([i for i in list(range(args.num_samples))]) 
 
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>
-"""
-
-XML_COT_FORMAT = """\
-<reasoning>
-{reasoning}
-</reasoning>
-<answer>
-{answer}
-</answer>
-"""
-
-def extract_xml_answer(text: str) -> str:
-    """Extracts the answer from XML-formatted text."""
-    try:
-        answer = text.split("<answer>")[-1].split("</answer>")[0].strip()
-        return answer
-    except IndexError:
-        logger.warning("Failed to extract answer from XML format.")
-        return ""
-
-def extract_hash_answer(text: str) -> str | None:
-    """Extracts the answer from a hash-formatted string."""
-    if "####" not in text:
-        return None
-    return text.split("####")[1].strip()
-
-# Environment variables
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./models")
-RUN_NAME = os.getenv("RUN_NAME", "default-GRPO-gsm8k")
-
-def get_gsm8k_questions(split="train", use_one_shot=False) -> Dataset:
-    """Loads and prepares the GSM8K dataset with optional one-shot prompting."""
-    try:
-        data = load_dataset('openai/gsm8k', 'main')[split]
-        log_to_wandb({"dataset_size": len(data)})  # Conditional logging
-    except Exception as e:
-        logger.error(f"Failed to load dataset: {e}")
-        raise
-
-    def format_example(x):
-        prompt = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-        if use_one_shot:
-            prompt.extend([
-                {'role': 'user', 'content': 'What is the largest single-digit prime number?'},
-                {'role': 'assistant', 'content': XML_COT_FORMAT.format(
-                    reasoning="9 is divisible by 3 and 8 is divisible by 2, but 7 is prime.",
-                    answer="7"
-                )}
-            ])
-        prompt.append({'role': 'user', 'content': x['question']})
-        return {'prompt': prompt, 'answer': extract_hash_answer(x['answer'])}
-
-    return data.map(format_example)
-
-dataset = get_gsm8k_questions(use_one_shot=True)
-
-# Simplified reward functions with conditional logging
-def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
-    """Calculates reward based on correctness of the response."""
-    responses = [completion[0]['content'] for completion in completions]
-    extracted_responses = [extract_xml_answer(r) for r in responses]
-    rewards = [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
-    
-    # Conditional logging - just accuracy
-    accuracy = sum(1 for r in rewards if r > 0) / len(rewards)
-    log_to_wandb({"accuracy": accuracy})
-    
-    return rewards
-
-def int_reward_func(completions, **kwargs) -> list[float]:
-    """Calculates reward if the extracted response is a digit."""
-    responses = [completion[0]['content'] for completion in completions]
-    extracted_responses = [extract_xml_answer(r) for r in responses]
-    rewards = [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
-    
-    # Conditional logging
-    digit_rate = sum(1 for r in rewards if r > 0) / len(rewards)
-    log_to_wandb({"digit_extraction_rate": digit_rate})
-    
-    return rewards
-
-def format_reward_func(completions, strict=False, **kwargs) -> list[float]:
-    """Calculates reward based on XML formatting."""
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.search(pattern, r, re.DOTALL) for r in responses]
-    rewards = [0.5 if match else 0.0 for match in matches]
-    
-    # Conditional logging
-    format_rate = sum(1 for r in rewards if r > 0) / len(rewards)
-    log_to_wandb({"format_success_rate": format_rate})
-    
-    return rewards
-
-def xmlcount_reward_func(completions, **kwargs) -> list[float]:
-    """Calculates reward based on XML tag counts."""
-    contents = [completion[0]["content"] for completion in completions]
-    rewards = [count_xml(c) for c in contents]
-    
-    # Conditional logging
-    avg_xml_score = sum(rewards) / len(rewards) if rewards else 0
-    log_to_wandb({"avg_xml_score": avg_xml_score})
-    
-    return rewards
-
-def count_xml(text) -> float:
-    """Counts XML tags and penalizes extra content."""
-    count = 0.0
-    if text.count("<reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n</reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n<answer>\n") == 1:
-        count += 0.125
-        count -= len(text.split("\n</answer>\n")[-1]) * 0.001
-    if text.count("\n</answer>") == 1:
-        count += 0.125
-        count -= (len(text.split("\n</answer>")[-1]) - 1) * 0.001
-    return count
-
-# Model setup
 try:
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        args.model_name,
         torch_dtype=torch.bfloat16,
-        # attn_implementation="flash_attention_2",
-        device_map="auto"
+        device_map="auto",
     ).to("cuda")
-    
-    # Conditional model info logging
-    num_params = sum(p.numel() for p in model.parameters())
-    log_to_wandb({"model_parameters": num_params})
-    
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     raise
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 tokenizer.pad_token = tokenizer.eos_token
 
-# Training config - conditional report_to
+# PEFT config (optional)
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+    task_type="CAUSAL_LM",
+    lora_dropout=0.05,
+)
+
+#Force model to have different generations
+gc = model.generation_config
+gc.do_sample = True
+gc.top_p = 0.95
+gc.temperature = 1.0
+model.generation_config = gc
+
 training_args = GRPOConfig(
-    output_dir="./models",
-    run_name=RUN_NAME,
+    output_dir=args.output_dir,
+    run_name=args.run_name,
     learning_rate=5e-6,
     adam_beta1=0.9,
     adam_beta2=0.99,
     weight_decay=0.1,
     warmup_ratio=0.1,
     lr_scheduler_type='cosine',
-    logging_steps=10,  # Log every 10 steps
+    logging_steps=10,
     bf16=True,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=2,
-    num_generations=8,
-    generation_batch_size=8,
+    per_device_train_batch_size=2,  
+    gradient_accumulation_steps=2,  
+    num_generations=4,
     max_prompt_length=256,
-    max_completion_length=1024,
+    max_completion_length=512,
     num_train_epochs=1,
-    save_steps=100,
+    save_steps=250,
     max_grad_norm=0.1,
-    report_to="wandb" if use_wandb else None,  # Conditional reporting
-    log_on_each_node=False,
+    report_to="wandb"
 )
 
-# Trainer setup
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
     reward_funcs=[
         xmlcount_reward_func,
-        format_reward_func,
+        format_reward_func,  
         int_reward_func,
         correctness_reward_func
     ],
     args=training_args,
     train_dataset=dataset,
+    peft_config=peft_config  
 )
 
-# Train with simple error handling
 try:
-    logger.info("Starting training...")
-    log_to_wandb({"status": "training_started"})
-    
     trainer.train()
-    
-    log_to_wandb({"status": "training_completed"})
-    logger.info("Training completed!")
-    
 except Exception as e:
     logger.error(f"Training failed: {e}")
-    log_to_wandb({"status": "training_failed", "error": str(e)})
     raise
 
-finally:
-    if use_wandb:
-        wandb.finish()
+
+
+
